@@ -148,7 +148,25 @@ int main(void) {
         ok("overlay: a name relative to the game's folder", hle_host_path("rules.ini", p, sizeof p) && strcasestr(p, "/mod/RULES.INI"));
         hle_set_overlay(NULL, NULL);
         ok("overlay off: the game's file again", hle_host_path("C:\\rules.ini", p, sizeof p) && strstr(p, "/game/rules.ini"));
+
+        /* GetFullPathNameA: guest paths, never the host's, with . and ..
+         * resolved (Hard Truck 2 builds ".\\.\ENV\*.way" through it). */
+        hle_set_drive('C', "/tmp/hleov");                 /* the cwd, /tmp/hleov/game, is C:\game */
+        uint32_t V_Full = hle_resolve("GetFullPathNameA"), fb = hle_va(hle_alloc(260)), fp = hle_va(hle_alloc(4));
+        const char *fbs = hle_ptr(fb);
+#define FULL(name, size) hle_call_guest(V_Full, 4, (uint32_t[]){ hle_guest_strdup(name), size, fb, fp })
+        ok("full path: relative, . and empty components", FULL(".\\\\.\\ENV\\*.way", 260) == 17 &&
+           !strcmp(fbs, "C:\\game\\ENV\\*.way") && !strcmp(hle_ptr(MEM32(fp)), "*.way"));
+        ok("full path: ..", FULL("a\\..\\b.txt", 260) == 13 && !strcmp(fbs, "C:\\game\\b.txt"));
+        ok("full path: rooted, on the current drive", FULL("\\x/y", 260) == 6 && !strcmp(fbs, "C:\\x\\y"));
+        ok("full path: another drive", FULL("D:\\x\\.\\y\\..\\z", 260) == 6 && !strcmp(fbs, "D:\\x\\z"));
+        ok("full path: .. stops at the root", FULL("..\\..\\..", 260) == 3 && !strcmp(fbs, "C:\\"));
+        ok("full path: a directory keeps its '\\', no file part", FULL("dir\\", 260) == 12 &&
+           !strcmp(fbs, "C:\\game\\dir\\") && MEM32(fp) == 0);
+        ok("full path: too small a buffer says how much", FULL("b.txt", 4) == 14);
+#undef FULL
     }
+
 
     /* .ini as Windows reads it: CRLF lines, blanks around '=' (Hard Truck 2's
      * kmjin.ini: "type = 0x10204"), comments and quotes, the section and key
