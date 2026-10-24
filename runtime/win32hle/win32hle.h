@@ -300,6 +300,11 @@ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
  * itself as the pump hook. headless: no window (a script drives input). */
 int  hle_screen_open(const char *title, int fullscreen, int headless);
+/* SDL scancode -> Windows virtual key (0: none) and PC/AT set-1 scan code,
+ * for a host that runs its own SDL window and feeds hle_input_key itself. */
+int      hle_sdl_vk(int sdl_scancode);
+uint32_t hle_sdl_scan(int sdl_scancode);
+
 void hle_screen_pump(void);
 extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */
 void hle_screen_title(const char *title);

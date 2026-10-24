@@ -85,7 +85,8 @@ int (*hle_screen_compose_hook)(const uint8_t *px16, int pitch, int w, int h, uin
 static uint32_t *g_hd;
 static size_t g_hd_n;
 
-static int vk_of(SDL_Scancode s) {
+int hle_sdl_vk(int sdl_scancode) {
+    SDL_Scancode s = (SDL_Scancode)sdl_scancode;
     if (s >= SDL_SCANCODE_A && s <= SDL_SCANCODE_Z) return 'A' + (s - SDL_SCANCODE_A);
     if (s >= SDL_SCANCODE_1 && s <= SDL_SCANCODE_9) return '1' + (s - SDL_SCANCODE_1);
     if (s >= SDL_SCANCODE_F1 && s <= SDL_SCANCODE_F12) return 0x70 + (s - SDL_SCANCODE_F1);
@@ -133,7 +134,8 @@ static int vk_of(SDL_Scancode s) {
     }
 }
 /* the PC/AT set-1 scan code, which lParam carries */
-static uint32_t scan_of(SDL_Scancode s) {
+uint32_t hle_sdl_scan(int sdl_scancode) {
+    SDL_Scancode s = (SDL_Scancode)sdl_scancode;
     static const uint8_t t[SDL_NUM_SCANCODES] = {
         [SDL_SCANCODE_ESCAPE] = 0x01, [SDL_SCANCODE_1] = 2, [SDL_SCANCODE_2] = 3, [SDL_SCANCODE_3] = 4, [SDL_SCANCODE_4] = 5,
         [SDL_SCANCODE_5] = 6, [SDL_SCANCODE_6] = 7, [SDL_SCANCODE_7] = 8, [SDL_SCANCODE_8] = 9, [SDL_SCANCODE_9] = 10,
@@ -547,8 +549,8 @@ void hle_screen_pump(void) {
                 }
                 break;
             }
-            int vk = vk_of(e.key.keysym.scancode);
-            if (vk) hle_input_key(e.type == SDL_KEYDOWN, (uint32_t)vk, scan_of(e.key.keysym.scancode));
+            int vk = hle_sdl_vk(e.key.keysym.scancode);
+            if (vk) hle_input_key(e.type == SDL_KEYDOWN, (uint32_t)vk, hle_sdl_scan(e.key.keysym.scancode));
             break;
         }
         case SDL_MOUSEMOTION: {
