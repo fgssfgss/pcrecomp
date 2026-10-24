@@ -329,7 +329,7 @@ static int write_cfb(const char *path, node_t *root) {
 }
 
 /* ---- the objects ---- */
-static uint32_t g_vt_stg, g_vt_stm;
+static uint32_t g_vt_stg, g_vt_stm, g_vt_enum;
 typedef struct { file_t *file; node_t *node; uint32_t pos; } obj_t;   /* at +8 of the COM object */
 #define OBJ(self) ((obj_t *)hle_ptr(MEM32((self) + 8)))   /* in guest memory (hle_alloc): the VA fits */
 
@@ -503,6 +503,53 @@ static void st_DestroyElement(void) {
 }
 static void st_SetClass(void) { obj_t *o = OBJ(A32(0)); memcpy(o->node->clsid, APTR(1), 16); o->file->dirty = 1; RET(S_OK, 2); }
 static void st_Stat(void) { stat_of(A32(1), OBJ(A32(0))->node, A32(2) & 1); RET(S_OK, 3); }
+/* IStorage::EnumElements and its IEnumSTATSTG: an object on the storage's
+ * node whose pos is the next child to hand out, in the compound file's own
+ * order (length, then upper case: Windows' red-black directory walks the
+ * same way). Names in the STATSTGs are the caller's (CoTaskMemFree). */
+static int sorted_children(node_t *p, node_t **out, int max) {
+    int n = 0;
+    for (node_t *c = p->child; c && n < max; c = c->next) out[n++] = c;
+    for (int i = 1; i < n; i++)                          /* insertion sort: a storage holds a handful */
+        for (int j = i; j > 0 && wcmp_upper(out[j - 1]->name, out[j]->name) > 0; j--) {
+            node_t *t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
+        }
+    return n;
+}
+static void st_EnumElements(void) {                      /* (this, r1, r2, r3, &enum) */
+    obj_t *o = OBJ(A32(0));
+    if (!A32(4)) RET(STG_E_INVALIDPOINTER, 5);
+    MEM32(A32(4)) = new_obj(g_vt_enum, o->file, o->node);
+    RET(S_OK, 5);
+}
+static void en_QueryInterface(void) { qi(0x0Du); }      /* IEnumSTATSTG {0000000D-...} */
+static void en_Next(void) {                              /* (this, celt, STATSTG*, &fetched) */
+    obj_t *o = OBJ(A32(0));
+    node_t *kids[1024];
+    int n = sorted_children(o->node, kids, 1024);
+    uint32_t want = A32(1), got = 0;
+    while (got < want && (int)o->pos < n) stat_of(A32(2) + 72u * got++, kids[o->pos++], 0);
+    if (A32(3)) MEM32(A32(3)) = got;
+    RET(got == want ? S_OK : S_FALSE, 4);
+}
+static void en_Skip(void) {                              /* (this, celt) */
+    obj_t *o = OBJ(A32(0));
+    node_t *kids[1024];
+    uint32_t n = (uint32_t)sorted_children(o->node, kids, 1024);
+    o->pos += A32(1);
+    if (o->pos > n) { o->pos = n; RET(S_FALSE, 2); }
+    RET(S_OK, 2);
+}
+static void en_Reset(void) { OBJ(A32(0))->pos = 0; RET(S_OK, 1); }
+static void en_Clone(void) {                             /* (this, &enum) */
+    obj_t *o = OBJ(A32(0));
+    if (!A32(1)) RET(STG_E_INVALIDPOINTER, 2);
+    uint32_t c = new_obj(g_vt_enum, o->file, o->node);
+    OBJ(c)->pos = o->pos;
+    MEM32(A32(1)) = c;
+    RET(S_OK, 2);
+}
+
 static void x_notimpl_2(void) { RET(E_NOTIMPL, 2); }
 static void x_notimpl_4(void) { RET(E_NOTIMPL, 4); }
 static void x_notimpl_5(void) { RET(E_NOTIMPL, 5); }
@@ -524,11 +571,18 @@ static void vtables(void) {
         { "IStorage::OpenStream", st_OpenStream }, { "IStorage::CreateStorage", st_CreateStorage },
         { "IStorage::OpenStorage", st_OpenStorage }, { "IStorage::CopyTo", x_notimpl_5 },
         { "IStorage::MoveElementTo", x_notimpl_5 }, { "IStorage::Commit", st_Commit }, { "IStorage::Revert", x_ok_1 },
-        { "IStorage::EnumElements", x_notimpl_5 }, { "IStorage::DestroyElement", st_DestroyElement },
+        { "IStorage::EnumElements", st_EnumElements }, { "IStorage::DestroyElement", st_DestroyElement },
         { "IStorage::RenameElement", x_notimpl_3 }, { "IStorage::SetElementTimes", x_notimpl_5 },
         { "IStorage::SetClass", st_SetClass }, { "IStorage::SetStateBits", x_ok_3 }, { "IStorage::Stat", st_Stat }, { 0, 0 } };
+    static const win32hle_shim en[] = {
+        { "IEnumSTATSTG::QueryInterface", en_QueryInterface }, { "IEnumSTATSTG::AddRef", hle_com_AddRef },
+        { "IEnumSTATSTG::Release", x_Release }, { "IEnumSTATSTG::Next", en_Next },
+        { "IEnumSTATSTG::Skip", en_Skip }, { "IEnumSTATSTG::Reset", en_Reset },
+        { "IEnumSTATSTG::Clone", en_Clone }, { 0, 0 } };
     g_vt_stm = hle_com_vtable(stm);
     g_vt_stg = hle_com_vtable(stg);
+    g_vt_enum = hle_com_vtable(en);
+
     (void)x_notimpl_2, (void)x_notimpl_4;
 }
 

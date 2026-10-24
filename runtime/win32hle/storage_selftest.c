@@ -36,6 +36,8 @@ int main(void) {
         uint8_t bigdata[10000], back[10000];
         char hello[18];
         uint32_t stg, s2, stm, n;
+        uint32_t en, en2, fetched;
+        uint8_t st[3 * 72];                           /* STATSTG[3] */
     } *g = hle_alloc(sizeof *g);
     wide(g->file, "Z:\\tmp\\win32hle_storage.sav");
     wide(g->sub, "Scenario"), wide(g->small, "Header"), wide(g->big, "Data");
@@ -73,6 +75,32 @@ int main(void) {
     ok("OpenStream big", vcall(g->s2, 4, 5, r2) == 0 && g->stm);
     vcall(g->stm, 3, 3, rd);
     ok("big read back", g->n == sizeof g->bigdata && !memcmp(g->back, g->bigdata, sizeof g->bigdata));
+
+    /* EnumElements over the sub-storage: both streams, in the compound file's
+     * order (shorter name first), then Next past the end, Reset, Skip, Clone. */
+    uint32_t ee[4] = { 0, 0, 0, P(&g->en) };
+    ok("EnumElements", vcall(g->s2, 11, 4, ee) == 0 && g->en);
+    uint32_t nx[3] = { 3, P(g->st), P(&g->fetched) };
+    uint32_t hr = vcall(g->en, 3, 3, nx);
+    const uint16_t *n0 = hle_ptr(*(uint32_t *)g->st), *n1 = hle_ptr(*(uint32_t *)(g->st + 72));
+    ok("Next: both, S_FALSE for the third", hr == 1 && g->fetched == 2);
+    ok("Next: Data then Header", n0 && n1 && n0[0] == 'D' && n0[4] == 0 && n1[0] == 'H' && n1[6] == 0);
+    ok("Next: stream type and size", *(uint32_t *)(g->st + 4) == 2 && *(uint32_t *)(g->st + 8) == sizeof g->bigdata &&
+       *(uint32_t *)(g->st + 72 + 8) == sizeof g->hello);
+    uint32_t one[3] = { 1, P(g->st), P(&g->fetched) };
+    ok("Next at the end: none", vcall(g->en, 3, 3, one) == 1 && g->fetched == 0);
+    ok("Reset", vcall(g->en, 5, 0, NULL) == 0);
+    uint32_t sk[1] = { 1 };
+    ok("Skip one", vcall(g->en, 4, 1, sk) == 0);
+    n0 = NULL;
+    ok("Next after Skip: Header", vcall(g->en, 3, 3, one) == 0 && g->fetched == 1 &&
+       (n0 = hle_ptr(*(uint32_t *)g->st)) && n0[0] == 'H');
+    uint32_t cl[1] = { P(&g->en2) };
+    ok("Clone at the end: nothing left", vcall(g->en, 6, 1, cl) == 0 && g->en2 &&
+       vcall(g->en2, 3, 3, one) == 1 && g->fetched == 0);
+    vcall(g->en2, 2, 0, NULL);
+    vcall(g->en, 2, 0, NULL);
+
     vcall(g->stm, 2, 0, NULL);
     vcall(g->s2, 2, 0, NULL);
     vcall(g->stg, 2, 0, NULL);
