@@ -566,67 +566,191 @@ static void k_GetDriveTypeA(void) {
     RET(hle_host_path(path, host, sizeof host) && host[0] ? 3u : 1u, 1);
 }
 
-/* ---- .ini profile: a minimal reader/writer over a flat key=value file ----
- * Enough for a game remembering settings; sections are honoured on read. */
-static FILE *ini_open(const char *file, const char *mode) {
+/* ---- .ini profile ----
+ * Windows' semantics, over the file read whole: sections and keys match
+ * without case, blanks around a key and its value do not count, a value in
+ * matching quotes loses them, ';' starts a comment line. A NULL section lists
+ * the section names and a NULL key a section's keys, each NUL-terminated with
+ * one more NUL at the end (truncated: size - 2 returned, as Windows does).
+ * Writes rewrite the file in place: the key replaced, or added to its section,
+ * or a new section appended; a NULL value deletes the key, a NULL key the
+ * whole section. */
+static char *ini_load(const char *file, size_t *len) {
     char path[1024];
     if (!file) return NULL;
     hle_host_path(file, path, sizeof path);
-    return fopen(path, mode);
-}
-static int ini_find_section(FILE *f, const char *section) {
-    char line[512]; char want[256];
-    snprintf(want, sizeof want, "[%s]", section);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
     rewind(f);
-    while (fgets(line, sizeof line, f))
-        if (line[0] == '[' && !strncasecmp(line, want, strlen(want))) return 1;
-    return 0;
+    char *t = malloc(n > 0 ? (size_t)n + 1 : 1);
+    size_t got = n > 0 ? fread(t, 1, (size_t)n, f) : 0;
+    fclose(f);
+    t[got] = 0;
+    if (len) *len = got;
+    return t;
+}
+/* One logical line: [b, e) with blanks trimmed off both ends. */
+typedef struct { const char *b, *e, *next; } ini_line;
+static int ini_next(const char **p, ini_line *l) {
+    const char *s = *p;
+    if (!*s) return 0;
+    const char *eol = s + strcspn(s, "\r\n");
+    l->next = eol + strspn(eol, "\r\n");
+    while (s < eol && (*s == ' ' || *s == '\t')) s++;
+    const char *e = eol;
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+    l->b = s, l->e = e;
+    *p = l->next;
+    return 1;
+}
+static int ini_is_section(const ini_line *l, const char **nb, const char **ne) {
+    if (l->b >= l->e || *l->b != '[') return 0;
+    const char *b = l->b + 1, *e = memchr(b, ']', (size_t)(l->e - b));
+    if (!e) e = l->e;
+    while (b < e && (*b == ' ' || *b == '\t')) b++;
+    while (e > b && (e[-1] == ' ' || e[-1] == '\t')) e--;
+    *nb = b, *ne = e;
+    return 1;
+}
+/* key = value: the key and value trimmed, the value's matching quotes gone */
+static int ini_is_key(const ini_line *l, const char **kb, const char **ke, const char **vb, const char **ve) {
+    if (l->b >= l->e || *l->b == ';' || *l->b == '[') return 0;
+    const char *eq = memchr(l->b, '=', (size_t)(l->e - l->b));
+    if (!eq) return 0;
+    const char *k1 = eq;
+    while (k1 > l->b && (k1[-1] == ' ' || k1[-1] == '\t')) k1--;
+    const char *v0 = eq + 1;
+    while (v0 < l->e && (*v0 == ' ' || *v0 == '\t')) v0++;
+    const char *v1 = l->e;
+    if (v1 - v0 >= 2 && (*v0 == '"' || *v0 == '\'') && v1[-1] == *v0) v0++, v1--;
+    *kb = l->b, *ke = k1, *vb = v0, *ve = v1;
+    return 1;
+}
+static int ini_eq(const char *b, const char *e, const char *want) {
+    size_t n = (size_t)(e - b);
+    return strlen(want) == n && !strncasecmp(b, want, n);
+}
+/* Append [b, e) + NUL to a double-NUL list in buf; 0 once it no longer fits. */
+static int ini_list_add(char *buf, uint32_t size, uint32_t *at, const char *b, const char *e) {
+    size_t n = (size_t)(e - b);
+    if (*at + n + 2 > size) {
+        if (size >= 2) {                                 /* Windows: as much as fits, then two NULs */
+            size_t room = size - 2 > *at ? size - 2 - *at : 0;
+            memcpy(buf + *at, b, room < n ? room : n);
+            buf[size - 2] = 0, buf[size - 1] = 0;
+        }
+        return 0;
+    }
+    memcpy(buf + *at, b, n);
+    *at += (uint32_t)n;
+    buf[(*at)++] = 0;
+    buf[*at] = 0;
+    return 1;
+}
+static uint32_t ini_get(const char *sec, const char *key, const char *def, char *buf, uint32_t size, const char *file) {
+    if (!buf || !size) return 0;
+    char *text = ini_load(file, NULL);
+    const char *p = text ? text : "";
+    ini_line l;
+    const char *nb, *ne, *kb, *ke, *vb, *ve;
+    uint32_t at = 0;
+    int in_sec = 0;
+    buf[0] = 0;
+    if (size >= 2) buf[1] = 0;
+    if (!sec) {                                          /* the section names */
+        while (ini_next(&p, &l))
+            if (ini_is_section(&l, &nb, &ne) && !ini_list_add(buf, size, &at, nb, ne)) { free(text); return size - 2; }
+        free(text);
+        return at;
+    }
+    while (ini_next(&p, &l)) {
+        if (ini_is_section(&l, &nb, &ne)) { in_sec = ini_eq(nb, ne, sec); continue; }
+        if (!in_sec || !ini_is_key(&l, &kb, &ke, &vb, &ve)) continue;
+        if (!key) {                                      /* the section's keys */
+            if (!ini_list_add(buf, size, &at, kb, ke)) { free(text); return size - 2; }
+            continue;
+        }
+        if (ini_eq(kb, ke, key)) {
+            size_t n = (size_t)(ve - vb);
+            if (n > size - 1) n = size - 1;
+            memcpy(buf, vb, n);
+            buf[n] = 0;
+            free(text);
+            return (uint32_t)n;
+        }
+    }
+    free(text);
+    if (!key) return at;
+    const char *d = def ? def : "";
+    size_t n = strlen(d);
+    while (n && (d[n - 1] == ' ' || d[n - 1] == '\t')) n--;   /* Windows trims the default's trailing blanks */
+    if (n > size - 1) n = size - 1;
+    memcpy(buf, d, n);
+    buf[n] = 0;
+    return (uint32_t)n;
 }
 static void k_GetPrivateProfileStringA(void) {           /* (sec,key,def,buf,size,file) */
-    const char *sec = ASTR(0), *key = ASTR(1), *def = ASTR(2);
-    char *buf = ASTR(3); uint32_t size = A32(4); const char *file = ASTR(5);
-    const char *val = def ? def : "";
-    char line[512];
-    FILE *f = ini_open(file, "r");
-    if (f && sec && key && ini_find_section(f, sec)) {
-        size_t kl = strlen(key);
-        while (fgets(line, sizeof line, f)) {
-            if (line[0] == '[') break;                   /* next section */
-            if (!strncasecmp(line, key, kl) && line[kl] == '=') {
-                char *v = line + kl + 1, *nl = strpbrk(v, "\r\n"); if (nl) *nl = 0;
-                static char out[512]; strncpy(out, v, sizeof out - 1); val = out; break;
-            }
-        }
-    }
-    if (f) fclose(f);
-    if (buf && size) { strncpy(buf, val, size - 1); buf[size - 1] = 0; }
-    RET(buf ? (uint32_t)strlen(buf) : 0u, 6);
+    RET(ini_get(ASTR(0), ASTR(1), ASTR(2), ASTR(3), A32(4), ASTR(5)), 6);
 }
 static void k_GetPrivateProfileIntA(void) {              /* (sec,key,def,file) */
-    char buf[64] = "", def[16];
-    snprintf(def, sizeof def, "%d", (int)A32(2));
-    const char *sec = ASTR(0), *key = ASTR(1), *file = ASTR(3);
-    FILE *f = ini_open(file, "r"); char line[512]; int got = 0;
-    if (f && sec && key && ini_find_section(f, sec)) {
-        size_t kl = strlen(key);
-        while (fgets(line, sizeof line, f)) {
-            if (line[0] == '[') break;
-            if (!strncasecmp(line, key, kl) && line[kl] == '=') { strncpy(buf, line + kl + 1, 63); got = 1; break; }
-        }
-    }
-    if (f) fclose(f);
-    RET((uint32_t)atoi(got ? buf : def), 4);
+    char buf[64];
+    if (!ASTR(0) || !ASTR(1) || !ini_get(ASTR(0), ASTR(1), "", buf, sizeof buf, ASTR(3))) RET(A32(2), 4);
+    /* RtlUnicodeStringToInteger, base 0: decimal, or 0x hex; digits up to the first other character */
+    const char *s = buf;
+    int neg = *s == '-';
+    if (*s == '-' || *s == '+') s++;
+    long v = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? strtol(s + 2, NULL, 16) : strtol(s, NULL, 10);
+    RET((uint32_t)(neg ? -v : v), 4);
 }
-/* WritePrivateProfileStringA: append the key under a (possibly new) section;
- * the reader takes the first match. A title that rewrites keys gets the
- * in-place version when it needs it. */
 static void k_WritePrivateProfileStringA(void) {         /* (sec,key,val,file) */
     const char *sec = ASTR(0), *key = ASTR(1), *val = ASTR(2), *file = ASTR(3);
-    if (file && sec && key) {
-        FILE *f = ini_open(file, "a");
-        if (f) { fprintf(f, "[%s]\n%s=%s\n", sec, key, val ? val : ""); fclose(f); }
+    if (!file || !sec) RET(0, 4);
+    size_t len = 0;
+    char *text = ini_load(file, &len);
+    const char *p = text ? text : "";
+    size_t cap = len + strlen(sec) + (key ? strlen(key) : 0) + (val ? strlen(val) : 0) + 16;
+    char *out = malloc(cap), *o = out;
+    ini_line l;
+    const char *nb, *ne, *kb, *ke, *vb, *ve;
+    int in_sec = 0, done = 0;
+#define EMIT(b, n) (memcpy(o, (b), (n)), o += (n))
+    while (ini_next(&p, &l)) {
+        const char *raw = l.b;                           /* the whole original line, blanks and all */
+        while (raw > (text ? text : p) && raw[-1] != '\n' && raw[-1] != '\r') raw--;
+        size_t raw_n = (size_t)(l.next - raw);
+        if (ini_is_section(&l, &nb, &ne)) {
+            if (in_sec && !done && key && val) {         /* leaving our section without the key: add it */
+                o += sprintf(o, "%s=%s\r\n", key, val);
+                done = 1;
+            }
+            in_sec = ini_eq(nb, ne, sec);
+            if (in_sec && !key) { done = 1; continue; }  /* deleting the section: drop its header */
+            EMIT(raw, raw_n);
+            continue;
+        }
+        if (in_sec && !key) continue;                    /* ... and its lines */
+        if (in_sec && !done && ini_is_key(&l, &kb, &ke, &vb, &ve) && ini_eq(kb, ke, key)) {
+            if (val) o += sprintf(o, "%s=%s\r\n", key, val);
+            done = 1;
+            continue;
+        }
+        EMIT(raw, raw_n);
     }
-    RET(1, 4);
+    if (o > out && o[-1] != '\n') EMIT("\r\n", 2);
+    if (!done && key && val) {
+        if (!in_sec) o += sprintf(o, "[%s]\r\n", sec);
+        o += sprintf(o, "%s=%s\r\n", key, val);
+    }
+#undef EMIT
+    char path[1024];
+    hle_host_path_for_write(file, path, sizeof path, 1);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(out, 1, (size_t)(o - out), f); fclose(f); }
+    free(out);
+    free(text);
+    RET(f ? 1u : 0u, 4);
 }
 
 /* ---- the Win16 _l* file family (an HFILE is our file HANDLE) ---- */

@@ -150,7 +150,61 @@ int main(void) {
         ok("overlay off: the game's file again", hle_host_path("C:\\rules.ini", p, sizeof p) && strstr(p, "/game/rules.ini"));
     }
 
+    /* .ini as Windows reads it: CRLF lines, blanks around '=' (Hard Truck 2's
+     * kmjin.ini: "type = 0x10204"), comments and quotes, the section and key
+     * lists a NULL section / key asks for, truncation, the Int variant's hex,
+     * and writes that replace, insert, add and delete in place. */
+    {
+        static const char ini[] = "/tmp/win32hle_k32ext_rd.ini";
+        FILE *f = fopen(ini, "wb");
+        fputs("[2-axis, 2-button joystick]\r\ntype = 0x10204\r\nnums = 2 2 0\r\n\r\n"
+              "[Second]\r\n;not a key = no\r\nName = \"quoted value\"\r\nCount=  42  \r\n", f);
+        fclose(f);
+        uint32_t V_Int = hle_resolve("GetPrivateProfileIntA");
+        /* Z: is the host's /: the overlay test above left C: and the cwd elsewhere */
+        uint32_t file = hle_guest_strdup("Z:\\tmp\\win32hle_k32ext_rd.ini");
+        uint32_t buf = hle_va(hle_alloc(256)), def = hle_guest_strdup("def  ");
+
+        uint32_t s1 = hle_guest_strdup("2-AXIS, 2-button joystick"), s2 = hle_guest_strdup("second");
+        uint32_t s3 = hle_guest_strdup("Third");
+        uint32_t k_type = hle_guest_strdup("TYPE"), k_name = hle_guest_strdup("name"), k_count = hle_guest_strdup("Count");
+        uint32_t k_none = hle_guest_strdup("none"), k_new = hle_guest_strdup("New"), k_k = hle_guest_strdup("K");
+        uint32_t v_7 = hle_guest_strdup("7"), v_1 = hle_guest_strdup("1"), v_v = hle_guest_strdup("V");
+        const char *b = hle_ptr(buf);
+#define GETS(sec, key, dflt, size) hle_call_guest(V_GetIni, 6, (uint32_t[]){ sec, key, dflt, buf, size, file })
+#define PUTS(sec, key, val) hle_call_guest(V_WriteIni, 4, (uint32_t[]){ sec, key, val, file })
+#define GETI(sec, key, dflt) hle_call_guest(V_Int, 4, (uint32_t[]){ sec, key, dflt, file })
+        ok("ini: blanks around '=' and case", GETS(s1, k_type, 0, 256) == 7 && !strcmp(b, "0x10204"));
+        ok("ini: matching quotes go", GETS(s2, k_name, 0, 256) == 12 && !strcmp(b, "quoted value"));
+        ok("ini: a missing key gives the default, trailing blanks trimmed", GETS(s2, k_none, def, 256) == 3 && !strcmp(b, "def"));
+        ok("ini: a comment line is no key", GETS(s2, hle_guest_strdup(";not a key"), 0, 256) == 0 && !b[0]);
+        ok("ini: NULL section lists the sections",
+           GETS(0, 0, 0, 256) == 33 && !memcmp(b, "2-axis, 2-button joystick\0Second\0\0", 34));
+        ok("ini: NULL key lists the keys", GETS(s2, 0, 0, 256) == 11 && !memcmp(b, "Name\0Count\0\0", 12));
+        ok("ini: a list that does not fit is cut, size - 2, two NULs",
+           GETS(0, 0, 0, 10) == 8 && !memcmp(b, "2-axis, \0\0", 10));
+        ok("ini: a value that does not fit is cut", GETS(s1, k_type, 0, 4) == 3 && !strcmp(b, "0x1"));
+        ok("ini: Int, decimal with blanks", GETI(s2, k_count, 5) == 42);
+        ok("ini: Int, hex", GETI(s1, k_type, 5) == 0x10204);
+        ok("ini: Int, the default", GETI(s2, k_none, 5) == 5);
+        PUTS(s2, k_count, v_7);
+        PUTS(s2, k_new, v_1);
+        PUTS(s3, k_k, v_v);
+        PUTS(s2, k_name, 0);
+        ok("ini write: a key replaced in place", GETI(s2, k_count, 5) == 7);
+        ok("ini write: a key added to its section", GETS(s2, 0, 0, 256) == 10 && !memcmp(b, "Count\0New\0\0", 11));
+        ok("ini write: a new section", GETS(s3, k_k, 0, 256) == 1 && !strcmp(b, "V"));
+        ok("ini write: other sections untouched", GETS(s1, k_type, 0, 256) == 7 && !strcmp(b, "0x10204"));
+        PUTS(s3, 0, 0);
+        ok("ini write: a NULL key deletes the section", GETS(0, 0, 0, 256) == 33);
+#undef GETS
+#undef PUTS
+#undef GETI
+        remove(ini);
+    }
+
     /* The guest's printf: arguments read from guest memory, and a spec of 19
+
      * flags, a 10-digit * width and ll stays inside its buffer (under ASan
      * this overflowed it). */
     {
