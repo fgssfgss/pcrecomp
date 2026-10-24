@@ -88,6 +88,22 @@ int main(void) {
     call(VA_BringWindowToTop, 1, (uint32_t[]){ b });
     ok("BringWindowToTop raises b", get_window(main_w, GW_CHILD) == b && get_window(b, GW_HWNDNEXT) == a);
 
+    /* Activation: SetWindowPos activates a visible top-level window unless
+     * SWP_NOACTIVATE, and destroying the active window activates the next
+     * one, focus with it. Hard Truck 2 destroys its menu frame and plays in
+     * a second one; with no active window its key messages went nowhere. */
+    uint32_t VA_Active = hle_resolve("GetActiveWindow"), VA_Focus = hle_resolve("GetFocus");
+    uint32_t VA_Destroy = hle_resolve("DestroyWindow");
+    uint32_t f1 = create(0x10000000u /* WS_VISIBLE */, 0, 0), f2 = create(0x10000000u, 0, 0);
+    set_window_pos(f2, 0, SWP_NOSIZE_NOMOVE | 0x40u /* SWP_SHOWWINDOW */);
+    ok("SetWindowPos activates", call(VA_Active, 0, NULL) == f2 && call(VA_Focus, 0, NULL) == f2);
+    set_window_pos(f1, 0, SWP_NOSIZE_NOMOVE | 0x10u /* SWP_NOACTIVATE */);
+    ok("SWP_NOACTIVATE does not", call(VA_Active, 0, NULL) == f2);
+    call(VA_Destroy, 1, (uint32_t[]){ f2 });
+    ok("destroying the active window activates the next one", call(VA_Active, 0, NULL) == f1);
+    ok("... and the focus goes with it", call(VA_Focus, 0, NULL) == f1);
+
     if (fails == 0) printf("zorder_selftest: all checks passed\n");
+
     return fails != 0;
 }

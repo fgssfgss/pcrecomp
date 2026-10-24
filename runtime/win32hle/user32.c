@@ -453,6 +453,8 @@ static void uncover(win_t *x) {
     if (p) invalidate_rect(p, x->x, x->y, x->x + x->w, x->y + x->h);   /* and the siblings it covered */
 }
 
+static void activate(uint32_t h);
+
 static void destroy(uint32_t h) {
     win_t *x = W(h);
     if (!x || x->destroying) return;
@@ -466,11 +468,24 @@ static void destroy(uint32_t h) {
     if (!x) return;
     if (g_focus == h) g_focus = 0;
     if (g_capture == h) g_capture = 0;
-    if (g_active == h) g_active = 0;
+    int was_active = g_active == h;
+    if (was_active) g_active = 0;
     for (int i = 0; i < MAX_TIMERS; i++) if (g_timer[i].used && g_timer[i].hwnd == h) g_timer[i].used = 0;
     for (int i = 0; i < g_qn; i++) if (g_q[i].hwnd == h) g_q[i].message = 0xFFFFFFFFu;   /* dropped when popped */
     item_free(x);
     x->used = 0;
+    /* Windows activates another window when the active one goes: the topmost
+     * visible top-level one left. Without this, a program that destroys its
+     * first frame window and carries on in a second (Hard Truck 2, menu to
+     * race) had no active window, and every key message was dropped. */
+    if (was_active && !g_active) {
+        win_t *next = NULL;
+        for (int i = 0; i < MAX_WIN; i++) {
+            win_t *c = &g_win[i];
+            if (c->used && !c->destroying && !c->parent && (c->style & WS_VISIBLE) && (!next || c->z < next->z)) next = c;
+        }
+        if (next) activate(next->hwnd);
+    }
 }
 
 static void set_focus(uint32_t h) {
@@ -1521,17 +1536,20 @@ static void u_ShowWindow(void) {
         hle_send(x->hwnd, WM_SHOWWINDOW, (uint32_t)show, 0);
         if ((x = W(A32(0))) && show) invalidate(x, 1);
     }
-    if (x && show && !x->parent && A32(1) != 4 && A32(1) != 8) {   /* not SHOWNOACTIVATE / SHOWNA */
-        uint32_t old = g_active;
-        g_active = x->hwnd;
-        if (old != x->hwnd) {
-            hle_send(x->hwnd, WM_ACTIVATEAPP, 1, 0);
-            hle_send(x->hwnd, WM_NCACTIVATE, 1, 0);
-            hle_send(x->hwnd, WM_ACTIVATE, 1, old);
-            if (!g_focus || !is_descendant(g_focus, x->hwnd)) set_focus(x->hwnd);
-        }
-    }
+    if (x && show && !x->parent && A32(1) != 4 && A32(1) != 8)    /* not SHOWNOACTIVATE / SHOWNA */
+        activate(x->hwnd);
     RET((uint32_t)was, 2);
+}
+/* Make a top-level window the active one: the messages ShowWindow sends, and
+ * the focus to it unless it is already somewhere inside it. */
+static void activate(uint32_t h) {
+    uint32_t old = g_active;
+    g_active = h;
+    if (old == h) return;
+    hle_send(h, WM_ACTIVATEAPP, 1, 0);
+    hle_send(h, WM_NCACTIVATE, 1, 0);
+    hle_send(h, WM_ACTIVATE, 1, old);
+    if (W(h) && (!g_focus || !is_descendant(g_focus, h))) set_focus(h);
 }
 static void u_UpdateWindow(void) {
     win_t *x = W(A32(0));
@@ -1736,7 +1754,10 @@ static void u_SetWindowPos(void) {                       /* (h, after, x, y, cx,
     if ((x = W(A32(0)))) {
         if (fl & 0x40u) { x->style |= WS_VISIBLE; invalidate(x, 1); }   /* SWP_SHOWWINDOW */
         if (fl & 0x80u) x->style &= ~WS_VISIBLE;                        /* SWP_HIDEWINDOW */
+        /* without SWP_NOACTIVATE a visible top-level window is activated, as on Windows */
+        if (!(fl & 0x10u) && !x->parent && (x->style & WS_VISIBLE)) activate(x->hwnd);
     }
+
     RET(1, 7);
 }
 static void u_BringWindowToTop(void) { win_t *x = W(A32(0)); if (x) zorder(x, 0); RET(x != NULL, 1); }
